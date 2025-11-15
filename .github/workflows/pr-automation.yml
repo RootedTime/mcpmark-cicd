@@ -1,0 +1,432 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        id: cq_install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: Run ESLint (prefer npm run lint)
+        id: cq_eslint
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          STATUS="failure"
+          if npm run -s lint -- --format junit --output-file eslint-junit.xml; then
+            STATUS="success"
+          else
+            echo "npm run lint failed or not defined; attempting fallback with npx eslint@latest" >&2 || true
+            npx --yes eslint@latest . -f junit -o eslint-junit.xml || true
+          fi
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Prettier check
+        id: cq_prettier
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          npx --yes prettier@latest -v >/dev/null 2>&1 || true
+          # Check a broad set of common file types
+          npx --yes prettier@latest -c "**/*.{js,jsx,ts,tsx,json,md,yml,yaml,css,scss,html}" > prettier-output.txt 2>&1 || true
+          if [ -s prettier-output.txt ]; then
+            echo "had_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Prettier issues" > prettier-output.txt
+            echo "had_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload code-quality artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-artifacts
+          path: |
+            eslint-junit.xml
+            prettier-output.txt
+          if-no-files-found: ignore
+
+      - name: Post Code Quality PR Comment
+        id: cq_comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ESLINT_STATUS: ${{ steps.cq_eslint.outputs.status }}
+          PRETTIER_HAD_CHANGES: ${{ steps.cq_prettier.outputs.had_changes }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { context, github } = require('@actions/github');
+            const eslintStatus = process.env.ESLINT_STATUS || 'unknown';
+            const prettierIssues = process.env.PRETTIER_HAD_CHANGES === 'true';
+            const body = [
+              'Code Quality Report',
+              '',
+              `ESLint: ${eslintStatus === 'success' ? 'Passed' : 'Issues Detected or Not Configured'}`,
+              `Prettier: ${prettierIssues ? 'Formatting issues detected' : 'No issues'}`,
+              '',
+              'Artifacts: code-quality-artifacts'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        id: ts_install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: Run tests with coverage
+        id: ts_test
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Try to run tests with coverage flag (Jest-like)
+          if npm test -- --coverage; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tests failed or no test script; attempting fallback" >&2 || true
+            npm test || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize coverage
+        id: ts_cov
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUMMARY=""
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+              const fs = require("fs");
+              const s = JSON.parse(fs.readFileSync("coverage/coverage-summary.json", "utf8"));
+              const t = s.total || {};
+              const fmt = (k) => t[k] ? `${t[k].pct}% (${t[k].covered}/${t[k].total})` : "N/A";
+              console.log(`lines=${fmt("lines")}`);
+              console.log(`statements=${fmt("statements")}`);
+              console.log(`branches=${fmt("branches")}`);
+              console.log(`functions=${fmt("functions")}`);
+            ' | tee coverage-summary.txt
+            awk -F= '{print "::notice::" $0}' coverage-summary.txt || true
+            while IFS== read -r k v; do echo "$k=$v" >> "$GITHUB_OUTPUT"; done < coverage-summary.txt
+          else
+            echo "No coverage summary found" | tee coverage-summary.txt
+            echo "lines=N/A" >> "$GITHUB_OUTPUT"
+            echo "statements=N/A" >> "$GITHUB_OUTPUT"
+            echo "branches=N/A" >> "$GITHUB_OUTPUT"
+            echo "functions=N/A" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/
+            coverage-summary.txt
+          if-no-files-found: ignore
+
+      - name: Post Test Coverage PR Comment
+        id: ts_comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          LINES: ${{ steps.ts_cov.outputs.lines }}
+          STATEMENTS: ${{ steps.ts_cov.outputs.statements }}
+          BRANCHES: ${{ steps.ts_cov.outputs.branches }}
+          FUNCTIONS: ${{ steps.ts_cov.outputs.functions }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { context, github } = require('@actions/github');
+            const body = [
+              'Test Coverage Report',
+              '',
+              `Lines: ${process.env.LINES || 'N/A'}`,
+              `Statements: ${process.env.STATEMENTS || 'N/A'}`,
+              `Branches: ${process.env.BRANCHES || 'N/A'}`,
+              `Functions: ${process.env.FUNCTIONS || 'N/A'}`,
+              '',
+              'Artifacts: coverage-artifacts'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        id: sec_install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: npm audit (json)
+        id: sec_audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          npm audit --json > audit.json || true
+          # Extract a simple summary if available
+          node -e '
+            const fs = require("fs");
+            try {
+              const j = JSON.parse(fs.readFileSync("audit.json", "utf8"));
+              const sc = (j.metadata && j.metadata.vulnerabilities) || j.vulnerabilities || {};
+              const sum = Object.entries(sc).map(([k,v])=>`${k}:${v}`).join(", ");
+              console.log(`summary=${sum}`);
+            } catch (e) { console.log("summary=unavailable"); }
+          ' | tee audit-summary.txt
+          while IFS== read -r k v; do echo "$k=$v" >> "$GITHUB_OUTPUT"; done < <(grep '^summary=' audit-summary.txt || echo 'summary=unavailable')
+
+      - name: Secrets scan (gitleaks)
+        id: sec_gitleaks
+        continue-on-error: true
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: --no-git -v --redact --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts
+          path: |
+            audit.json
+            audit-summary.txt
+            gitleaks.sarif
+          if-no-files-found: ignore
+
+      - name: Post Security Scan PR Comment
+        id: sec_comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          AUDIT_SUMMARY: ${{ steps.sec_audit.outputs.summary }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { context, github } = require('@actions/github');
+            const body = [
+              'Security Scan Report',
+              '',
+              `Dependencies: ${process.env.AUDIT_SUMMARY || 'unavailable'}`,
+              'Vulnerabilities: See audit.json in security-artifacts and gitleaks.sarif for secrets findings.',
+              '',
+              'Artifacts: security-artifacts'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        id: bv_install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: Build application
+        id: bv_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          if npm run -s build; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start app and validate endpoints (best-effort)
+        id: bv_smoketest
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm run -s start &> /dev/null & then
+            S_PID=$!
+            echo "pid=${S_PID}" >> "$GITHUB_OUTPUT"
+            # Give the app some time to boot
+            for i in {1..30}; do sleep 1; done
+            ports=(3000 3001 5173 8080 4200)
+            ok=0
+            for p in "${ports[@]}"; do
+              if curl -fsS "http://localhost:$p/" >/dev/null 2>&1; then
+                echo "endpoint=http://localhost:$p/" >> "$GITHUB_OUTPUT"
+                ok=1
+                break
+              fi
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "endpoint=unavailable" >> "$GITHUB_OUTPUT"
+            fi
+            kill "$S_PID" >/dev/null 2>&1 || true
+          else
+            echo "endpoint=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package preview artifacts
+        id: bv_artifacts
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p preview
+          for dir in dist build out public; do
+            if [ -d "$dir" ]; then
+              cp -r "$dir" "preview/$dir"
+            fi
+          done
+          if [ -d preview ]; then
+            echo "packaged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packaged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build preview artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview
+          path: preview/
+          if-no-files-found: ignore
+
+      - name: Post Build Validation PR Comment
+        id: bv_comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          BUILD_STATUS: ${{ steps.bv_build.outputs.status }}
+          ENDPOINT: ${{ steps.bv_smoketest.outputs.endpoint }}
+          PACKAGED: ${{ steps.bv_artifacts.outputs.packaged }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { context, github } = require('@actions/github');
+            const status = process.env.BUILD_STATUS || 'unknown';
+            const endpoint = process.env.ENDPOINT || 'unknown';
+            const packaged = process.env.PACKAGED === 'true';
+            const body = [
+              'Build Validation',
+              '',
+              `Build status: ${status}`,
+              `Endpoint check: ${endpoint}`,
+              `Deployment preview artifacts: ${packaged ? 'created' : 'not created'}`,
+              '',
+              'Artifacts: build-preview'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
